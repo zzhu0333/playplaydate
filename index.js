@@ -1,17 +1,20 @@
 // =============================================================
-//  🏀 HOOPS — LINE 籃球約團投票機器人
-//  發起人開團 → 大家在群組點按鈕投票 → 即時統計、記名 + 人數
+//  🏀 HOOPS — LINE 籃球約團投票機器人 v2
 // =============================================================
+//  喚醒指令（在群組直接打字，不用斜線）：
+//    開團 標題 | 場地        例: 開團 週日籃球 | 中山運動中心
+//      （也可開團同時一次貼多個時段，每行一個，例如：
+//        開團 週日籃球 | 中山
+//        5/31 18:00-20:00
+//        6/7 16:00-18:00 ）
+//    加時段                  一次可多行，每行一個時段
+//    結果                    看目前票數與完整名單
+//    結束                    （限發起人）鎖定投票並公布結果
+//    關團 / 取消             清掉本團
+//    說明 / help             看用法
 //
-//  指令（在 LINE 群組裡輸入）：
-//    /開團 標題 | 場地           例: /開團 週日籃球 | 中山運動中心
-//    /加時段 5/31 18:00-20:00    （開團後逐個加，可加多筆）
-//    /結果                       看目前票數與名單
-//    /關團                       清掉這次的團，重新開
-//    /help                       看說明
-//
-//  投票方式：機器人會把每個時段做成按鈕，群組成員直接點按鈕即可。
-//  一個人可複選多個時段；再點一次同一時段＝取消。
+//  投票：點卡片上的時段按鈕即可（可複選，再點一次取消）。
+//  有人投票後，機器人會主動推送「誰投了 + 各時段人數 + 已投名單」。
 // =============================================================
 
 const express = require("express");
@@ -19,57 +22,82 @@ const crypto = require("crypto");
 const https = require("https");
 
 const app = express();
-
-// LINE 設定（從環境變數讀，部署時填）
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const CHANNEL_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 
-// ------- 資料儲存（記憶體版；重啟會清空，足夠約團這種短期用途） -------
-// polls[groupId] = { title, venue, slots: [{ id, label, voters: [name] }] }
+// ---- 記憶體儲存（重啟會清空）----
+// polls[gid] = { title, venue, ownerId, locked, slots:[{id,label,voters:[{id,name}]}] }
 const polls = {};
-
-function getDisplayName(source) {
-  // 取得使用者顯示名稱需呼叫 LINE API；為了簡單，先用 userId 末碼當代稱，
-  // 並提供「/我是 名字」讓使用者自訂顯示名。實務上多數人會先設定一次。
-  return null;
-}
-
-// userId -> 自訂名字
-const nameMap = {};
+// 抓到的 LINE 名稱快取： userId -> name
+const nameCache = {};
+// 防洗版：gid -> 最近一次 push 的計時器
+const pushTimers = {};
 
 // =============================================================
-//  LINE 回覆工具
+//  LINE API 工具
 // =============================================================
-function lineReply(replyToken, messages) {
-  const body = JSON.stringify({ replyToken, messages });
+function lineApi(method, path, payload, cb) {
+  const body = payload ? JSON.stringify(payload) : null;
   const options = {
     hostname: "api.line.me",
-    path: "/v2/bot/message/reply",
-    method: "POST",
+    path,
+    method,
     headers: {
-      "Content-Type": "application/json",
       Authorization: "Bearer " + CHANNEL_TOKEN,
-      "Content-Length": Buffer.byteLength(body),
     },
   };
+  if (body) {
+    options.headers["Content-Type"] = "application/json";
+    options.headers["Content-Length"] = Buffer.byteLength(body);
+  }
   const req = https.request(options, (res) => {
     let d = "";
     res.on("data", (c) => (d += c));
     res.on("end", () => {
-      if (res.statusCode >= 300) console.error("LINE reply error:", res.statusCode, d);
+      if (res.statusCode >= 300) console.error("LINE API error:", method, path, res.statusCode, d);
+      if (cb) cb(res.statusCode, d);
     });
   });
-  req.on("error", (e) => console.error("LINE reply request error:", e));
-  req.write(body);
+  req.on("error", (e) => console.error("LINE API request error:", e));
+  if (body) req.write(body);
   req.end();
 }
 
-// 文字訊息
+function reply(replyToken, messages) {
+  lineApi("POST", "/v2/bot/message/reply", { replyToken, messages });
+}
+function pushTo(to, messages) {
+  lineApi("POST", "/v2/bot/message/push", { to, messages });
+}
 function txt(text) {
   return { type: "text", text };
 }
 
-// 把時段做成可點的投票卡片（Flex）
+// 抓 LINE 顯示名稱（群組成員 / 一對一），抓到就快取
+function resolveName(source, cb) {
+  const uid = source.userId;
+  if (!uid) return cb("某人");
+  if (nameCache[uid]) return cb(nameCache[uid]);
+
+  let path;
+  if (source.type === "group") path = "/v2/bot/group/" + source.groupId + "/member/" + uid;
+  else if (source.type === "room") path = "/v2/bot/room/" + source.roomId + "/member/" + uid;
+  else path = "/v2/bot/profile/" + uid;
+
+  lineApi("GET", path, null, (code, d) => {
+    let name = "球友" + uid.slice(-4);
+    try {
+      const j = JSON.parse(d);
+      if (j.displayName) name = j.displayName;
+    } catch (e) {}
+    nameCache[uid] = name;
+    cb(name);
+  });
+}
+
+// =============================================================
+//  畫面組裝
+// =============================================================
 function buildVoteFlex(poll) {
   const rows = poll.slots.map((s) => ({
     type: "box",
@@ -79,9 +107,11 @@ function buildVoteFlex(poll) {
       {
         type: "button",
         style: "primary",
-        color: "#ff6a2b",
+        color: poll.locked ? "#555555" : "#ff6a2b",
         height: "sm",
-        action: { type: "postback", label: "投 " + s.label, data: "vote:" + s.id, displayText: "我投 " + s.label },
+        action: poll.locked
+          ? { type: "postback", label: "已結束", data: "noop" }
+          : { type: "postback", label: s.label, data: "vote:" + s.id, displayText: "我投 " + s.label },
         flex: 5,
       },
       {
@@ -106,12 +136,10 @@ function buildVoteFlex(poll) {
         layout: "vertical",
         spacing: "md",
         contents: [
-          { type: "text", text: "🏀 " + poll.title, weight: "bold", size: "lg", color: "#ffffff" },
-          poll.venue
-            ? { type: "text", text: "📍 " + poll.venue, size: "sm", color: "#aaaaaa" }
-            : { type: "filler" },
+          { type: "text", text: "🏀 " + poll.title + (poll.locked ? "（已結束）" : ""), weight: "bold", size: "lg", color: "#ffffff", wrap: true },
+          poll.venue ? { type: "text", text: "📍 " + poll.venue, size: "sm", color: "#aaaaaa", wrap: true } : { type: "filler" },
           { type: "separator", color: "#333333" },
-          { type: "text", text: "點按鈕投票（可複選，再點一次取消）", size: "xs", color: "#888888" },
+          { type: "text", text: poll.locked ? "投票已結束" : "點時段按鈕投票（可複選，再點一次取消）", size: "xs", color: "#888888", wrap: true },
           ...rows,
         ],
       },
@@ -120,142 +148,207 @@ function buildVoteFlex(poll) {
   };
 }
 
-function buildResultText(poll) {
+// 精簡推送：誰投了 + 一行各時段人數
+function buildPushText(poll, who, slotLabel) {
+  const line = poll.slots.map((s) => s.label.split(" ")[0] + "→" + s.voters.length).join("｜");
+  return "🏀 " + poll.title + "\n" + who + " 投了 " + slotLabel + "\n目前：" + line;
+}
+
+// 完整名單（打「結果」或「結束」時）
+function buildResultText(poll, finalize) {
   const sorted = poll.slots.slice().sort((a, b) => b.voters.length - a.voters.length);
-  let t = "🏀 " + poll.title + "\n";
+  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n";
   if (poll.venue) t += "📍 " + poll.venue + "\n";
-  t += "\n目前票數：\n";
+  t += "\n";
   sorted.forEach((s, i) => {
-    const crown = i === 0 && s.voters.length > 0 ? "👑 " : "";
-    t += crown + s.label + "　" + s.voters.length + "人";
-    if (s.voters.length) t += "（" + s.voters.join("、") + "）";
-    t += "\n";
+    const crown = i === 0 && s.voters.length > 0 ? "👑 " : "　";
+    t += crown + s.label + "　" + s.voters.length + "人\n";
+    if (s.voters.length) t += "　　" + s.voters.map((v) => v.name).join("、") + "\n";
   });
   if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n";
+  if (finalize && sorted[0] && sorted[0].voters.length > 0) {
+    t += "\n✅ 最多人：" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
+  }
   return t.trim();
+}
+
+// 防洗版：0.8 秒內多次投票只推一次最新狀態
+function schedulePush(gid, poll) {
+  if (pushTimers[gid]) clearTimeout(pushTimers[gid]);
+  const pending = poll._pending;
+  poll._pending = null;
+  pushTimers[gid] = setTimeout(() => {
+    if (pending) pushTo(gid, [buildVoteFlex(poll), txt(buildPushText(poll, pending.who, pending.label))]);
+    pushTimers[gid] = null;
+  }, 800);
+}
+
+// =============================================================
+//  解析時段：把多行文字拆成時段陣列
+// =============================================================
+function parseSlots(text) {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && /\d/.test(l)); // 含數字的行視為時段
+}
+
+function addSlots(poll, labels) {
+  labels.forEach((label) => {
+    poll.slots.push({ id: "s" + poll.slots.length + Date.now().toString(36).slice(-3), label, voters: [] });
+  });
 }
 
 // =============================================================
 //  Webhook
 // =============================================================
-// 用 raw body 才能驗章
 app.use("/webhook", express.raw({ type: "*/*" }));
 
 app.post("/webhook", (req, res) => {
-  // 驗證 LINE 簽章
   const signature = req.headers["x-line-signature"];
   const hash = crypto.createHmac("sha256", CHANNEL_SECRET).update(req.body).digest("base64");
   if (signature !== hash) {
     console.error("簽章驗證失敗");
     return res.status(401).send("bad signature");
   }
-  res.status(200).end(); // 先回 200，LINE 才不會重送
-
+  res.status(200).end();
   let payload;
   try {
     payload = JSON.parse(req.body.toString("utf8"));
   } catch (e) {
     return;
   }
-
-  (payload.events || []).forEach((event) => handleEvent(event));
+  (payload.events || []).forEach(handleEvent);
 });
 
-function groupKeyOf(source) {
+function gidOf(source) {
   return source.groupId || source.roomId || source.userId;
 }
 
 function handleEvent(event) {
   const source = event.source || {};
-  const gid = groupKeyOf(source);
+  const gid = gidOf(source);
   const uid = source.userId || "anon";
 
   // ---------- 點按鈕投票 ----------
   if (event.type === "postback") {
     const data = event.postback.data || "";
+    if (data === "noop") return;
     if (data.startsWith("vote:")) {
-      const slotId = data.slice(5);
       const poll = polls[gid];
-      if (!poll) return lineReply(event.replyToken, [txt("這個群組還沒開團，先打「/開團 標題 | 場地」")]);
-      const name = nameMap[uid] || ("球友" + uid.slice(-4));
-      const slot = poll.slots.find((s) => s.id === slotId);
+      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團，打「開團 標題 | 場地」開始")]);
+      if (poll.locked) return reply(event.replyToken, [txt("投票已經結束囉")]);
+      const slot = poll.slots.find((s) => s.id === data.slice(5));
       if (!slot) return;
-      const idx = slot.voters.indexOf(name);
-      if (idx > -1) slot.voters.splice(idx, 1); // 再點＝取消
-      else slot.voters.push(name);
-      return lineReply(event.replyToken, [buildVoteFlex(poll), txt(buildResultText(poll))]);
+      resolveName(source, (name) => {
+        const idx = slot.voters.findIndex((v) => v.id === uid);
+        if (idx > -1) slot.voters.splice(idx, 1);
+        else slot.voters.push({ id: uid, name });
+        // 安排推送（誰投了 + 最新票數），含防洗版
+        poll._pending = { who: name, label: slot.label };
+        schedulePush(gid, poll);
+      });
+      return;
     }
     return;
   }
 
-  // ---------- 文字指令 ----------
+  // ---------- 文字指令（自然詞，不用斜線）----------
   if (event.type === "message" && event.message.type === "text") {
-    const text = event.message.text.trim();
+    const raw = event.message.text.trim();
+    const firstLine = raw.split("\n")[0].trim();
+    const cmd = firstLine.replace(/^\//, ""); // 容許有沒有斜線都行
 
-    if (text === "/help" || text === "/說明") {
-      return lineReply(event.replyToken, [
+    // 說明
+    if (cmd === "說明" || cmd === "help" || cmd === "幫助") {
+      return reply(event.replyToken, [
         txt(
-          "🏀 約團投票指令：\n\n" +
-            "/開團 標題 | 場地\n" +
-            "　例：/開團 週日籃球 | 中山運動中心\n\n" +
-            "/加時段 5/31 18:00-20:00\n" +
-            "　（開團後逐個加，可加多筆）\n\n" +
-            "/我是 你的名字\n" +
-            "　（投票顯示這個名字）\n\n" +
-            "/結果　看目前票數\n" +
-            "/關團　結束這次的團"
+          "🏀 約團投票用法（直接打字，不用斜線）：\n\n" +
+            "【開團】可一次貼多個時段：\n" +
+            "開團 週日籃球 | 中山運動中心\n" +
+            "5/31 18:00-20:00\n" +
+            "6/7 16:00-18:00\n\n" +
+            "【加時段】開團後再補，一次可多行\n" +
+            "【投票】點卡片上的按鈕（可複選）\n" +
+            "【結果】看目前票數和名單\n" +
+            "【結束】發起人專用，鎖定並公布\n" +
+            "【關團】清掉重來"
         ),
       ]);
     }
 
-    if (text.startsWith("/我是")) {
-      const n = text.replace("/我是", "").trim();
-      if (!n) return lineReply(event.replyToken, [txt("用法：/我是 你的名字")]);
-      nameMap[uid] = n;
-      return lineReply(event.replyToken, [txt("好的，投票會顯示你是「" + n + "」")]);
-    }
-
-    if (text.startsWith("/開團")) {
-      const rest = text.replace("/開團", "").trim();
-      let title = rest, venue = "";
-      if (rest.includes("|")) {
-        const parts = rest.split("|");
-        title = parts[0].trim();
-        venue = parts[1].trim();
+    // 開團（可同時帶多時段）
+    if (cmd.startsWith("開團")) {
+      const headRest = firstLine.replace(/^\/?開團/, "").trim();
+      let title = headRest, venue = "";
+      if (headRest.includes("|")) {
+        const p = headRest.split("|");
+        title = p[0].trim();
+        venue = p[1].trim();
       }
-      polls[gid] = { title: title || "籃球揪團", venue, slots: [] };
-      return lineReply(event.replyToken, [
-        txt("✅ 已開團：" + (title || "籃球揪團") + (venue ? "（" + venue + "）" : "") + "\n\n接著用「/加時段 5/31 18:00-20:00」把可預約的時段加進來。"),
-      ]);
+      resolveName(source, (name) => {
+        polls[gid] = { title: title || "籃球揪團", venue, ownerId: uid, ownerName: name, locked: false, slots: [] };
+        // 第一行以外、含數字的行 → 當作時段一起加
+        const extraSlots = parseSlots(raw.split("\n").slice(1).join("\n"));
+        if (extraSlots.length) addSlots(polls[gid], extraSlots);
+        const msgs = [
+          txt(
+            "✅ 已開團：" + (title || "籃球揪團") + (venue ? "（" + venue + "）" : "") +
+              "\n發起人：" + name +
+              (extraSlots.length ? "" : "\n\n接著打「加時段」加可預約時段，一次可貼多行：\n加時段\n5/31 18:00-20:00\n6/7 16:00-18:00")
+          ),
+        ];
+        if (extraSlots.length) msgs.push(buildVoteFlex(polls[gid]));
+        reply(event.replyToken, msgs);
+      });
+      return;
     }
 
-    if (text.startsWith("/加時段")) {
-      const label = text.replace("/加時段", "").trim();
+    // 加時段（一次可多行）
+    if (cmd.startsWith("加時段")) {
       const poll = polls[gid];
-      if (!poll) return lineReply(event.replyToken, [txt("還沒開團，先打「/開團 標題 | 場地」")]);
-      if (!label) return lineReply(event.replyToken, [txt("用法：/加時段 5/31 18:00-20:00")]);
-      poll.slots.push({ id: "s" + (poll.slots.length + 1) + Date.now().toString(36).slice(-3), label, voters: [] });
-      return lineReply(event.replyToken, [txt("已加入時段：" + label), buildVoteFlex(poll)]);
+      if (!poll) return reply(event.replyToken, [txt("還沒開團，先打「開團 標題 | 場地」")]);
+      // 第一行去掉「加時段」後若有內容也算一個，加上後續各行
+      const inline = firstLine.replace(/^\/?加時段/, "").trim();
+      const labels = [];
+      if (inline && /\d/.test(inline)) labels.push(inline);
+      labels.push(...parseSlots(raw.split("\n").slice(1).join("\n")));
+      if (labels.length === 0) return reply(event.replyToken, [txt("用法（可多行）：\n加時段\n5/31 18:00-20:00\n6/7 16:00-18:00")]);
+      addSlots(poll, labels);
+      return reply(event.replyToken, [txt("已加入 " + labels.length + " 個時段：\n" + labels.join("\n")), buildVoteFlex(poll)]);
     }
 
-    if (text === "/結果") {
+    // 結果
+    if (cmd === "結果" || cmd === "票數") {
       const poll = polls[gid];
-      if (!poll) return lineReply(event.replyToken, [txt("這個群組還沒開團")]);
-      return lineReply(event.replyToken, [buildVoteFlex(poll), txt(buildResultText(poll))]);
+      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
+      return reply(event.replyToken, [buildVoteFlex(poll), txt(buildResultText(poll, false))]);
     }
 
-    if (text === "/關團") {
+    // 結束（限發起人）
+    if (cmd === "結束" || cmd === "定案") {
+      const poll = polls[gid];
+      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
+      if (poll.ownerId !== uid) {
+        return resolveName(source, () =>
+          reply(event.replyToken, [txt("只有發起人（" + poll.ownerName + "）可以結束投票喔")])
+        );
+      }
+      poll.locked = true;
+      return reply(event.replyToken, [txt(buildResultText(poll, true)), buildVoteFlex(poll)]);
+    }
+
+    // 關團
+    if (cmd === "關團" || cmd === "取消") {
       if (polls[gid]) {
         delete polls[gid];
-        return lineReply(event.replyToken, [txt("已關團，這次的投票清空了。想再揪打「/開團」。")]);
+        return reply(event.replyToken, [txt("已關團，這次投票清空。想再揪打「開團」。")]);
       }
-      return lineReply(event.replyToken, [txt("目前沒有進行中的團")]);
+      return reply(event.replyToken, [txt("目前沒有進行中的團")]);
     }
   }
 }
 
-// 健康檢查用（部署平台會打這個確認服務活著）
-app.get("/", (req, res) => res.send("🏀 HOOPS LINE bot is running"));
-
+app.get("/", (req, res) => res.send("🏀 HOOPS LINE bot v2 is running"));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("HOOPS bot listening on " + PORT));
+app.listen(PORT, () => console.log("HOOPS bot v2 listening on " + PORT));
