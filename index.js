@@ -110,19 +110,23 @@ function buildEntryFlex(poll, counts) {
   };
 }
 
-// 對齊好讀的結果文字（照使用者要的範例排版）
+// 對齊好讀的結果文字（編號條列、時間對齊，👑 最多人放最後）
 function buildResultText(poll, votersBySlot, finalize) {
   const slots = poll.slots.map((s) => ({ ...s, voters: votersBySlot[s.id] || [] }));
   const sorted = slots.slice().sort((a, b) => b.voters.length - a.voters.length);
-  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n\n";
-  sorted.forEach((s, i) => {
-    const crown = i === 0 && s.voters.length > 0 ? "👑 " : "　";
-    t += crown + s.label + "　" + s.voters.length + "人\n";
-    if (s.voters.length) t += "　　" + s.voters.join("、") + "\n";
+
+  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n";
+  t += "━━━━━━━━━━\n";
+  sorted.forEach((s) => {
+    t += "▸ " + s.label + "　" + s.voters.length + " 人\n";
+    if (s.voters.length) {
+      s.voters.forEach((name, idx) => { t += "　" + (idx + 1) + ". " + name + "\n"; });
+    }
+    t += "\n";
   });
-  if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n";
+  if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n\n";
   if (finalize && sorted[0] && sorted[0].voters.length > 0)
-    t += "\n✅ 最多人：" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
+    t += "👑 最多人：" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
   return t.trim();
 }
 
@@ -192,8 +196,8 @@ async function handleEvent(event) {
         slots, locked: false,
       }).select().single();
       if (error) { console.error(error); return reply(event.replyToken, [txt("開團失敗，請稍後再試")]); }
-      const msgs = [txt("✅ 已開團：" + title + "\n發起人：" + name +
-        (slots.length ? "" : "\n\n再用「加時段」補上時段，每行一個：\n加時段\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園"))];
+      const msgs = [txt("✅ 已開團　發起人：" + name +
+        (slots.length ? "" : "\n\n請複製下方格式、填好後送出：\n\n開團 球團名稱\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n（每行一個時段，格式為「日期 時間 地點」）"))];
       if (slots.length) msgs.push(buildEntryFlex(data, {}));
       reply(event.replyToken, msgs);
     });
@@ -287,9 +291,10 @@ app.post("/api/poll/:id/vote", async (req, res) => {
   // 推送最新統計到群組
   const vbs = await getVotersBySlot(pollId);
   const counts = await getCounts(pollId);
-  const summary = poll.slots.map((s) => s.label.split(" ")[0] + "→" + (counts[s.id] || 0)).join("｜");
+  let summary = "🏀 " + poll.title + "\n" + name + " 更新了投票\n━━━━━━━━━━\n";
+  poll.slots.forEach((s) => { summary += "▸ " + s.label + "　" + (counts[s.id] || 0) + " 人\n"; });
   pushTo(poll.group_id, [
-    txt("🏀 " + poll.title + "\n" + name + " 更新了投票\n目前：" + summary),
+    txt(summary.trim()),
     buildEntryFlex(poll, counts),
   ]);
   res.json({ ok: true, votersBySlot: vbs });
