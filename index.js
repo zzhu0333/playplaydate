@@ -67,7 +67,7 @@ function resolveName(source, cb) {
   else if (source.type === "room") path = "/v2/bot/room/" + source.roomId + "/member/" + uid;
   else path = "/v2/bot/profile/" + uid;
   lineApi("GET", path, null, (code, d) => {
-    let name = "球友" + uid.slice(-4);
+    let name = "成員" + uid.slice(-4);
     try { const j = JSON.parse(d); if (j.displayName) name = j.displayName; } catch (e) {}
     cb(name);
   });
@@ -87,13 +87,13 @@ function buildEntryFlex(poll, counts) {
   }));
   return {
     type: "flex",
-    altText: "🏀 " + poll.title + " 開始投票",
+    altText: poll.title + " 開始投票",
     contents: {
       type: "bubble",
       body: {
         type: "box", layout: "vertical", spacing: "md",
         contents: [
-          { type: "text", text: "🏀 " + poll.title + (poll.locked ? "（已結束）" : ""), weight: "bold", size: "lg", color: "#ffffff", wrap: true },
+          { type: "text", text: poll.title + (poll.locked ? "（已結束）" : ""), weight: "bold", size: "lg", color: "#ffffff", wrap: true },
           { type: "separator", color: "#333333" },
           ...slotLines,
         ],
@@ -115,7 +115,7 @@ function buildResultText(poll, votersBySlot, finalize) {
   const slots = poll.slots.map((s) => ({ ...s, voters: votersBySlot[s.id] || [] }));
   const sorted = slots.slice().sort((a, b) => b.voters.length - a.voters.length);
 
-  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n";
+  let t = (finalize ? "📢 投票結束！\n" : "") + poll.title + "\n";
   t += "━━━━━━━━━━\n";
   sorted.forEach((s) => {
     t += "▸ " + s.label + "　" + s.voters.length + " 人\n";
@@ -179,25 +179,38 @@ async function handleEvent(event) {
   // 說明
   if (cmd === "說明" || cmd === "help" || cmd === "幫助") {
     return reply(event.replyToken, [txt(
-      "🏀 約團投票用法：\n\n【開團】可一次貼多個時段地點：\n開團 籃球揪團\n5/31 18:00-20:00 台北運動中心\n6/7 16:00-18:00 桃園\n\n【投票】點卡片「前往投票」按鈕，在網頁勾選後送出\n【結果】看目前票數名單\n【結束】發起人專用，鎖定公布\n【關團】清掉重來"
+      "📋 約團投票用法：\n\n【開團】可一次貼多個時段地點：\n開團 （請輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n【投票】點卡片「前往投票」按鈕，在網頁勾選後送出\n【結果】看目前票數名單\n【結束】發起人專用，鎖定公布\n【關團】清掉重來"
     )]);
   }
 
   // 開團（可同時多時段；可選擇加應到名單）
   if (cmd.startsWith("開團")) {
-    const title = firstLine.replace(/^\/?開團/, "").trim() || "籃球揪團";
+    const title = firstLine.replace(/^\/?開團/, "").trim();
     const slotLabels = parseSlots(raw.split("\n").slice(1).join("\n"));
+
+    // 只打「開團」兩字（沒帶名稱、沒帶時段）→ 只回引導，先不建團
+    if (!title && slotLabels.length === 0) {
+      return resolveName(source, (name) =>
+        reply(event.replyToken, [txt(
+          "✅ 收到，發起人：" + name +
+          "\n\n請複製下方格式、填好後送出：\n\n" +
+          "開團 （請輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n" +
+          "（每行一個時段，格式為「日期 時間 地點」）"
+        )])
+      );
+    }
+
     resolveName(source, async (name) => {
       const slots = slotLabels.map((label, i) => ({ id: "s" + i, label }));
       // 關掉同群組舊的未結束投票
       await supabase.from("polls").update({ locked: true }).eq("group_id", gid).eq("locked", false);
       const { data, error } = await supabase.from("polls").insert({
-        group_id: gid, title, owner_id: uid, owner_name: name,
+        group_id: gid, title: title || "約團投票", owner_id: uid, owner_name: name,
         slots, locked: false,
       }).select().single();
       if (error) { console.error(error); return reply(event.replyToken, [txt("開團失敗，請稍後再試")]); }
-      const msgs = [txt("✅ 已開團　發起人：" + name +
-        (slots.length ? "" : "\n\n請複製下方格式、填好後送出：\n\n開團 球團名稱\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n（每行一個時段，格式為「日期 時間 地點」）"))];
+      const msgs = [txt("✅ 已開團：" + (title || "約團投票") + "　發起人：" + name +
+        (slots.length ? "" : "\n\n還沒加時段，請補上：\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園"))];
       if (slots.length) msgs.push(buildEntryFlex(data, {}));
       reply(event.replyToken, msgs);
     });
@@ -291,7 +304,7 @@ app.post("/api/poll/:id/vote", async (req, res) => {
   // 推送最新統計到群組
   const vbs = await getVotersBySlot(pollId);
   const counts = await getCounts(pollId);
-  let summary = "🏀 " + poll.title + "\n" + name + " 更新了投票\n━━━━━━━━━━\n";
+  let summary = poll.title + "\n" + name + " 更新了投票\n━━━━━━━━━━\n";
   poll.slots.forEach((s) => { summary += "▸ " + s.label + "　" + (counts[s.id] || 0) + " 人\n"; });
   pushTo(poll.group_id, [
     txt(summary.trim()),
