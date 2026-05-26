@@ -192,10 +192,11 @@ async function handleEvent(event) {
     if (!title && slotLabels.length === 0) {
       return resolveName(source, (name) =>
         reply(event.replyToken, [txt(
-          "✅ 收到，發起人：" + name +
+          "✅ 發起人：" + name +
           "\n\n請複製下方格式、填好後送出：\n\n" +
-          "開團 （請輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n" +
           "（每行一個時段，格式為「日期 時間 地點」）"
+          "開團（輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n" +
+          
         )])
       );
     }
@@ -209,7 +210,7 @@ async function handleEvent(event) {
         slots, locked: false,
       }).select().single();
       if (error) { console.error(error); return reply(event.replyToken, [txt("開團失敗，請稍後再試")]); }
-      const msgs = [txt("✅ 已開團：" + (title || "約團投票") + "　發起人：" + name +
+      const msgs = [txt("✅ 已開團：" + (title || "約團投票") + "發起人：" + name +
         (slots.length ? "" : "\n\n還沒加時段，請補上：\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園"))];
       if (slots.length) msgs.push(buildEntryFlex(data, {}));
       reply(event.replyToken, msgs);
@@ -224,7 +225,7 @@ async function handleEvent(event) {
 
   // 加時段
   if (cmd.startsWith("加時段")) {
-    if (!poll) return reply(event.replyToken, [txt("還沒開團，先打「開團 標題」")]);
+    if (!poll) return reply(event.replyToken, [txt("還沒開團，先打「開團標題」")]);
     const inline = firstLine.replace(/^\/?加時段/, "").trim();
     const labels = [];
     if (inline && /\d/.test(inline)) labels.push(inline);
@@ -258,7 +259,7 @@ async function handleEvent(event) {
   if (cmd === "關團" || cmd === "取消") {
     if (!poll) return reply(event.replyToken, [txt("目前沒有進行中的團")]);
     await supabase.from("polls").update({ locked: true }).eq("id", poll.id);
-    return reply(event.replyToken, [txt("已關團。想再揪打「開團」。")]);
+    return reply(event.replyToken, [txt("已關團！想再揪輸入「開團」")]);
   }
 }
 
