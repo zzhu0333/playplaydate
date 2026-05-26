@@ -1,40 +1,35 @@
 // =============================================================
-//  🏀 HOOPS — LINE 籃球約團投票機器人 v2
+//  🏀 HOOPS LIFF — LINE 籃球約團投票（網頁版）
 // =============================================================
-//  喚醒指令（在群組直接打字，不用斜線）：
-//    開團 標題 | 場地        例: 開團 週日籃球 | 中山運動中心
-//      （也可開團同時一次貼多個時段，每行一個，例如：
-//        開團 週日籃球 | 中山
-//        5/31 18:00-20:00
-//        6/7 16:00-18:00 ）
-//    加時段                  一次可多行，每行一個時段
-//    結果                    看目前票數與完整名單
-//    結束                    （限發起人）鎖定投票並公布結果
-//    關團 / 取消             清掉本團
-//    說明 / help             看用法
+//  架構：
+//   - 群組打「開團」→ 機器人在資料庫建立投票 → 回「前往投票」卡片
+//   - 點卡片 → 開 LIFF 網頁 → 勾選時段 → 送出 → 寫入資料庫
+//   - 送出後 → 機器人推送最新統計到群組
+//   - 「誰沒投」：發起人開團時可附應到名單，網頁顯示已投/未投
+//   - 發起人打「結束」→ 鎖定並公布
 //
-//  投票：點卡片上的時段按鈕即可（可複選，再點一次取消）。
-//  有人投票後，機器人會主動推送「誰投了 + 各時段人數 + 已投名單」。
+//  需要的環境變數（Render）：
+//   LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
+//   LIFF_ID, SUPABASE_URL, SUPABASE_KEY
 // =============================================================
 
 const express = require("express");
 const crypto = require("crypto");
 const https = require("https");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const CHANNEL_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
+const LIFF_ID = process.env.LIFF_ID || "";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "";
 
-// ---- 記憶體儲存（重啟會清空）----
-// polls[gid] = { title, venue, ownerId, locked, slots:[{id,label,voters:[{id,name}]}] }
-const polls = {};
-// 抓到的 LINE 名稱快取： userId -> name
-const nameCache = {};
-// 防洗版：gid -> 最近一次 push 的計時器
-const pushTimers = {};
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // =============================================================
-//  LINE API 工具
+//  LINE API
 // =============================================================
 function lineApi(method, path, payload, cb) {
   const body = payload ? JSON.stringify(payload) : null;
@@ -42,9 +37,7 @@ function lineApi(method, path, payload, cb) {
     hostname: "api.line.me",
     path,
     method,
-    headers: {
-      Authorization: "Bearer " + CHANNEL_TOKEN,
-    },
+    headers: { Authorization: "Bearer " + CHANNEL_TOKEN },
   };
   if (body) {
     options.headers["Content-Type"] = "application/json";
@@ -58,297 +51,251 @@ function lineApi(method, path, payload, cb) {
       if (cb) cb(res.statusCode, d);
     });
   });
-  req.on("error", (e) => console.error("LINE API request error:", e));
+  req.on("error", (e) => console.error("LINE API req error:", e));
   if (body) req.write(body);
   req.end();
 }
+const reply = (replyToken, messages) => lineApi("POST", "/v2/bot/message/reply", { replyToken, messages });
+const pushTo = (to, messages) => lineApi("POST", "/v2/bot/message/push", { to, messages });
+const txt = (text) => ({ type: "text", text });
 
-function reply(replyToken, messages) {
-  lineApi("POST", "/v2/bot/message/reply", { replyToken, messages });
-}
-function pushTo(to, messages) {
-  lineApi("POST", "/v2/bot/message/push", { to, messages });
-}
-function txt(text) {
-  return { type: "text", text };
-}
-
-// 抓 LINE 顯示名稱（群組成員 / 一對一），抓到就快取
 function resolveName(source, cb) {
   const uid = source.userId;
   if (!uid) return cb("某人");
-  if (nameCache[uid]) return cb(nameCache[uid]);
-
   let path;
   if (source.type === "group") path = "/v2/bot/group/" + source.groupId + "/member/" + uid;
   else if (source.type === "room") path = "/v2/bot/room/" + source.roomId + "/member/" + uid;
   else path = "/v2/bot/profile/" + uid;
-
   lineApi("GET", path, null, (code, d) => {
     let name = "球友" + uid.slice(-4);
-    try {
-      const j = JSON.parse(d);
-      if (j.displayName) name = j.displayName;
-    } catch (e) {}
-    nameCache[uid] = name;
+    try { const j = JSON.parse(d); if (j.displayName) name = j.displayName; } catch (e) {}
     cb(name);
   });
 }
 
 // =============================================================
-//  畫面組裝
+//  投票卡片（含「前往投票」按鈕，開 LIFF）
 // =============================================================
-function buildVoteFlex(poll) {
-  const rows = poll.slots.map((s) => ({
-    type: "box",
-    layout: "horizontal",
-    spacing: "sm",
+function buildEntryFlex(poll, counts) {
+  const liffUrl = "https://liff.line.me/" + LIFF_ID + "?poll=" + poll.id;
+  const slotLines = (poll.slots || []).map((s) => ({
+    type: "box", layout: "horizontal",
     contents: [
-      {
-        type: "button",
-        style: "primary",
-        color: poll.locked ? "#555555" : "#ff6a2b",
-        height: "sm",
-        action: poll.locked
-          ? { type: "postback", label: "已結束", data: "noop" }
-          : { type: "postback", label: s.label, data: "vote:" + s.id, displayText: "我投 " + s.label },
-        flex: 5,
-      },
-      {
-        type: "text",
-        text: String(s.voters.length) + " 人",
-        size: "sm",
-        color: "#ffb347",
-        gravity: "center",
-        align: "end",
-        flex: 2,
-      },
+      { type: "text", text: s.label, size: "sm", color: "#dddddd", flex: 5, wrap: true },
+      { type: "text", text: (counts[s.id] || 0) + " 人", size: "sm", color: "#ffb347", flex: 2, align: "end" },
     ],
   }));
-
   return {
     type: "flex",
-    altText: "🏀 " + poll.title + " 投票",
+    altText: "🏀 " + poll.title + " 開始投票",
     contents: {
       type: "bubble",
       body: {
-        type: "box",
-        layout: "vertical",
-        spacing: "md",
+        type: "box", layout: "vertical", spacing: "md",
         contents: [
           { type: "text", text: "🏀 " + poll.title + (poll.locked ? "（已結束）" : ""), weight: "bold", size: "lg", color: "#ffffff", wrap: true },
-          poll.venue ? { type: "text", text: "📍 " + poll.venue, size: "sm", color: "#aaaaaa", wrap: true } : { type: "filler" },
           { type: "separator", color: "#333333" },
-          { type: "text", text: poll.locked ? "投票已結束" : "點時段按鈕投票（可複選，再點一次取消）", size: "xs", color: "#888888", wrap: true },
-          ...rows,
+          ...slotLines,
         ],
       },
-      styles: { body: { backgroundColor: "#181b22" } },
+      footer: poll.locked ? undefined : {
+        type: "box", layout: "vertical",
+        contents: [{
+          type: "button", style: "primary", color: "#ff6a2b",
+          action: { type: "uri", label: "前往投票 / 看誰投了", uri: liffUrl },
+        }],
+      },
+      styles: { body: { backgroundColor: "#181b22" }, footer: { backgroundColor: "#181b22" } },
     },
   };
 }
 
-// 精簡推送：誰投了 + 一行各時段人數
-function buildPushText(poll, who, slotLabel) {
-  const line = poll.slots.map((s) => s.label.split(" ")[0] + "→" + s.voters.length).join("｜");
-  return "🏀 " + poll.title + "\n" + who + " 投了 " + slotLabel + "\n目前：" + line;
-}
-
-// 完整名單（打「結果」或「結束」時）
-function buildResultText(poll, finalize) {
-  const sorted = poll.slots.slice().sort((a, b) => b.voters.length - a.voters.length);
-  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n";
-  if (poll.venue) t += "📍 " + poll.venue + "\n";
-  t += "\n";
+// 對齊好讀的結果文字（照使用者要的範例排版）
+function buildResultText(poll, votersBySlot, finalize) {
+  const slots = poll.slots.map((s) => ({ ...s, voters: votersBySlot[s.id] || [] }));
+  const sorted = slots.slice().sort((a, b) => b.voters.length - a.voters.length);
+  let t = (finalize ? "📢 投票結束！\n" : "") + "🏀 " + poll.title + "\n\n";
   sorted.forEach((s, i) => {
     const crown = i === 0 && s.voters.length > 0 ? "👑 " : "　";
     t += crown + s.label + "　" + s.voters.length + "人\n";
-    if (s.voters.length) t += "　　" + s.voters.map((v) => v.name).join("、") + "\n";
+    if (s.voters.length) t += "　　" + s.voters.join("、") + "\n";
   });
   if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n";
-  if (finalize && sorted[0] && sorted[0].voters.length > 0) {
+  if (finalize && sorted[0] && sorted[0].voters.length > 0)
     t += "\n✅ 最多人：" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
-  }
   return t.trim();
 }
 
-// 防洗版：0.8 秒內多次投票只推一次最新狀態
-function schedulePush(gid, poll) {
-  if (pushTimers[gid]) clearTimeout(pushTimers[gid]);
-  const pending = poll._pending;
-  poll._pending = null;
-  pushTimers[gid] = setTimeout(() => {
-    if (pending) pushTo(gid, [buildVoteFlex(poll), txt(buildPushText(poll, pending.who, pending.label))]);
-    pushTimers[gid] = null;
-  }, 800);
+// 取得某 poll 的票數統計
+async function getCounts(pollId) {
+  const { data } = await supabase.from("votes").select("slot_id").eq("poll_id", pollId);
+  const counts = {};
+  (data || []).forEach((v) => { counts[v.slot_id] = (counts[v.slot_id] || 0) + 1; });
+  return counts;
+}
+async function getVotersBySlot(pollId) {
+  const { data } = await supabase.from("votes").select("slot_id, name").eq("poll_id", pollId);
+  const m = {};
+  (data || []).forEach((v) => { (m[v.slot_id] = m[v.slot_id] || []).push(v.name); });
+  return m;
 }
 
 // =============================================================
-//  解析時段：把多行文字拆成時段陣列
+//  解析時段：每行一個「時間 地點」
 // =============================================================
 function parseSlots(text) {
-  return text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && /\d/.test(l)); // 含數字的行視為時段
-}
-
-function addSlots(poll, labels) {
-  labels.forEach((label) => {
-    poll.slots.push({ id: "s" + poll.slots.length + Date.now().toString(36).slice(-3), label, voters: [] });
-  });
+  return text.split("\n").map((l) => l.trim()).filter((l) => l && /\d/.test(l));
 }
 
 // =============================================================
 //  Webhook
 // =============================================================
 app.use("/webhook", express.raw({ type: "*/*" }));
-
 app.post("/webhook", (req, res) => {
   const signature = req.headers["x-line-signature"];
   const hash = crypto.createHmac("sha256", CHANNEL_SECRET).update(req.body).digest("base64");
-  if (signature !== hash) {
-    console.error("簽章驗證失敗");
-    return res.status(401).send("bad signature");
-  }
+  if (signature !== hash) return res.status(401).send("bad signature");
   res.status(200).end();
   let payload;
-  try {
-    payload = JSON.parse(req.body.toString("utf8"));
-  } catch (e) {
-    return;
-  }
+  try { payload = JSON.parse(req.body.toString("utf8")); } catch (e) { return; }
   (payload.events || []).forEach(handleEvent);
 });
 
-function gidOf(source) {
-  return source.groupId || source.roomId || source.userId;
-}
+const gidOf = (s) => s.groupId || s.roomId || s.userId;
 
-function handleEvent(event) {
+async function handleEvent(event) {
+  if (event.type !== "message" || event.message.type !== "text") return;
   const source = event.source || {};
   const gid = gidOf(source);
   const uid = source.userId || "anon";
+  const raw = event.message.text.trim();
+  const firstLine = raw.split("\n")[0].trim();
+  const cmd = firstLine.replace(/^\//, "");
 
-  // ---------- 點按鈕投票 ----------
-  if (event.type === "postback") {
-    const data = event.postback.data || "";
-    if (data === "noop") return;
-    if (data.startsWith("vote:")) {
-      const poll = polls[gid];
-      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團，打「開團 標題 | 場地」開始")]);
-      if (poll.locked) return reply(event.replyToken, [txt("投票已經結束囉")]);
-      const slot = poll.slots.find((s) => s.id === data.slice(5));
-      if (!slot) return;
-      resolveName(source, (name) => {
-        const idx = slot.voters.findIndex((v) => v.id === uid);
-        if (idx > -1) slot.voters.splice(idx, 1);
-        else slot.voters.push({ id: uid, name });
-        // 安排推送（誰投了 + 最新票數），含防洗版
-        poll._pending = { who: name, label: slot.label };
-        schedulePush(gid, poll);
-      });
-      return;
-    }
+  // 說明
+  if (cmd === "說明" || cmd === "help" || cmd === "幫助") {
+    return reply(event.replyToken, [txt(
+      "🏀 約團投票用法：\n\n【開團】可一次貼多個時段地點：\n開團 籃球揪團\n5/31 18:00-20:00 台北運動中心\n6/7 16:00-18:00 桃園\n\n【投票】點卡片「前往投票」按鈕，在網頁勾選後送出\n【結果】看目前票數名單\n【結束】發起人專用，鎖定公布\n【關團】清掉重來"
+    )]);
+  }
+
+  // 開團（可同時多時段；可選擇加應到名單）
+  if (cmd.startsWith("開團")) {
+    const title = firstLine.replace(/^\/?開團/, "").trim() || "籃球揪團";
+    const slotLabels = parseSlots(raw.split("\n").slice(1).join("\n"));
+    resolveName(source, async (name) => {
+      const slots = slotLabels.map((label, i) => ({ id: "s" + i, label }));
+      // 關掉同群組舊的未結束投票
+      await supabase.from("polls").update({ locked: true }).eq("group_id", gid).eq("locked", false);
+      const { data, error } = await supabase.from("polls").insert({
+        group_id: gid, title, owner_id: uid, owner_name: name,
+        slots, locked: false,
+      }).select().single();
+      if (error) { console.error(error); return reply(event.replyToken, [txt("開團失敗，請稍後再試")]); }
+      const msgs = [txt("✅ 已開團：" + title + "\n發起人：" + name +
+        (slots.length ? "" : "\n\n再用「加時段」補上時段，每行一個：\n加時段\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園"))];
+      if (slots.length) msgs.push(buildEntryFlex(data, {}));
+      reply(event.replyToken, msgs);
+    });
     return;
   }
 
-  // ---------- 文字指令（自然詞，不用斜線）----------
-  if (event.type === "message" && event.message.type === "text") {
-    const raw = event.message.text.trim();
-    const firstLine = raw.split("\n")[0].trim();
-    const cmd = firstLine.replace(/^\//, ""); // 容許有沒有斜線都行
+  // 取得目前群組進行中的投票
+  const { data: poll } = await supabase.from("polls")
+    .select("*").eq("group_id", gid).eq("locked", false)
+    .order("created_at", { ascending: false }).limit(1).single();
 
-    // 說明
-    if (cmd === "說明" || cmd === "help" || cmd === "幫助") {
-      return reply(event.replyToken, [
-        txt(
-          "🏀 約團投票用法（直接打字，不用斜線）：\n\n" +
-            "【開團】可一次貼多個時段：\n" +
-            "開團 週日籃球 | 中山運動中心\n" +
-            "5/31 18:00-20:00\n" +
-            "6/7 16:00-18:00\n\n" +
-            "【加時段】開團後再補，一次可多行\n" +
-            "【投票】點卡片上的按鈕（可複選）\n" +
-            "【結果】看目前票數和名單\n" +
-            "【結束】發起人專用，鎖定並公布\n" +
-            "【關團】清掉重來"
-        ),
-      ]);
-    }
+  // 加時段
+  if (cmd.startsWith("加時段")) {
+    if (!poll) return reply(event.replyToken, [txt("還沒開團，先打「開團 標題」")]);
+    const inline = firstLine.replace(/^\/?加時段/, "").trim();
+    const labels = [];
+    if (inline && /\d/.test(inline)) labels.push(inline);
+    labels.push(...parseSlots(raw.split("\n").slice(1).join("\n")));
+    if (!labels.length) return reply(event.replyToken, [txt("用法（每行一個）：\n加時段\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園")]);
+    const base = poll.slots.length;
+    const newSlots = poll.slots.concat(labels.map((label, i) => ({ id: "s" + (base + i), label })));
+    await supabase.from("polls").update({ slots: newSlots }).eq("id", poll.id);
+    const counts = await getCounts(poll.id);
+    return reply(event.replyToken, [txt("已加入 " + labels.length + " 個時段"), buildEntryFlex({ ...poll, slots: newSlots }, counts)]);
+  }
 
-    // 開團（可同時帶多時段）
-    if (cmd.startsWith("開團")) {
-      const headRest = firstLine.replace(/^\/?開團/, "").trim();
-      let title = headRest, venue = "";
-      if (headRest.includes("|")) {
-        const p = headRest.split("|");
-        title = p[0].trim();
-        venue = p[1].trim();
-      }
-      resolveName(source, (name) => {
-        polls[gid] = { title: title || "籃球揪團", venue, ownerId: uid, ownerName: name, locked: false, slots: [] };
-        // 第一行以外、含數字的行 → 當作時段一起加
-        const extraSlots = parseSlots(raw.split("\n").slice(1).join("\n"));
-        if (extraSlots.length) addSlots(polls[gid], extraSlots);
-        const msgs = [
-          txt(
-            "✅ 已開團：" + (title || "籃球揪團") + (venue ? "（" + venue + "）" : "") +
-              "\n發起人：" + name +
-              (extraSlots.length ? "" : "\n\n接著打「加時段」加可預約時段，一次可貼多行：\n加時段\n5/31 18:00-20:00\n6/7 16:00-18:00")
-          ),
-        ];
-        if (extraSlots.length) msgs.push(buildVoteFlex(polls[gid]));
-        reply(event.replyToken, msgs);
-      });
-      return;
-    }
+  // 結果
+  if (cmd === "結果" || cmd === "票數") {
+    if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
+    const vbs = await getVotersBySlot(poll.id);
+    const counts = await getCounts(poll.id);
+    return reply(event.replyToken, [buildEntryFlex(poll, counts), txt(buildResultText(poll, vbs, false))]);
+  }
 
-    // 加時段（一次可多行）
-    if (cmd.startsWith("加時段")) {
-      const poll = polls[gid];
-      if (!poll) return reply(event.replyToken, [txt("還沒開團，先打「開團 標題 | 場地」")]);
-      // 第一行去掉「加時段」後若有內容也算一個，加上後續各行
-      const inline = firstLine.replace(/^\/?加時段/, "").trim();
-      const labels = [];
-      if (inline && /\d/.test(inline)) labels.push(inline);
-      labels.push(...parseSlots(raw.split("\n").slice(1).join("\n")));
-      if (labels.length === 0) return reply(event.replyToken, [txt("用法（可多行）：\n加時段\n5/31 18:00-20:00\n6/7 16:00-18:00")]);
-      addSlots(poll, labels);
-      return reply(event.replyToken, [txt("已加入 " + labels.length + " 個時段：\n" + labels.join("\n")), buildVoteFlex(poll)]);
-    }
+  // 結束（限發起人）
+  if (cmd === "結束" || cmd === "定案") {
+    if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
+    if (poll.owner_id !== uid) return reply(event.replyToken, [txt("只有發起人（" + poll.owner_name + "）可以結束投票")]);
+    await supabase.from("polls").update({ locked: true }).eq("id", poll.id);
+    const vbs = await getVotersBySlot(poll.id);
+    return reply(event.replyToken, [txt(buildResultText({ ...poll, locked: true }, vbs, true))]);
+  }
 
-    // 結果
-    if (cmd === "結果" || cmd === "票數") {
-      const poll = polls[gid];
-      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
-      return reply(event.replyToken, [buildVoteFlex(poll), txt(buildResultText(poll, false))]);
-    }
-
-    // 結束（限發起人）
-    if (cmd === "結束" || cmd === "定案") {
-      const poll = polls[gid];
-      if (!poll) return reply(event.replyToken, [txt("這個群組還沒開團")]);
-      if (poll.ownerId !== uid) {
-        return resolveName(source, () =>
-          reply(event.replyToken, [txt("只有發起人（" + poll.ownerName + "）可以結束投票喔")])
-        );
-      }
-      poll.locked = true;
-      return reply(event.replyToken, [txt(buildResultText(poll, true)), buildVoteFlex(poll)]);
-    }
-
-    // 關團
-    if (cmd === "關團" || cmd === "取消") {
-      if (polls[gid]) {
-        delete polls[gid];
-        return reply(event.replyToken, [txt("已關團，這次投票清空。想再揪打「開團」。")]);
-      }
-      return reply(event.replyToken, [txt("目前沒有進行中的團")]);
-    }
+  // 關團
+  if (cmd === "關團" || cmd === "取消") {
+    if (!poll) return reply(event.replyToken, [txt("目前沒有進行中的團")]);
+    await supabase.from("polls").update({ locked: true }).eq("id", poll.id);
+    return reply(event.replyToken, [txt("已關團。想再揪打「開團」。")]);
   }
 }
 
-app.get("/", (req, res) => res.send("🏀 HOOPS LINE bot v2 is running"));
+// =============================================================
+//  給網頁用的 API
+// =============================================================
+app.use(express.json());
+app.use(express.static("public"));
+
+// 提供 LIFF ID 給前端
+app.get("/api/config", (req, res) => res.json({ liffId: LIFF_ID }));
+
+// 取得某投票的資料 + 目前票數 + 投票者
+app.get("/api/poll/:id", async (req, res) => {
+  const { data: poll } = await supabase.from("polls").select("*").eq("id", req.params.id).single();
+  if (!poll) return res.status(404).json({ error: "not found" });
+  const vbs = await getVotersBySlot(poll.id);
+  res.json({ poll, votersBySlot: vbs });
+});
+
+// 取得「某使用者目前投了哪些」
+app.get("/api/poll/:id/my", async (req, res) => {
+  const userId = req.query.userId;
+  const { data } = await supabase.from("votes").select("slot_id").eq("poll_id", req.params.id).eq("user_id", userId);
+  res.json({ slotIds: (data || []).map((v) => v.slot_id) });
+});
+
+// 送出投票（覆蓋該使用者在此 poll 的所有選擇）
+app.post("/api/poll/:id/vote", async (req, res) => {
+  const pollId = req.params.id;
+  const { userId, name, slotIds } = req.body;
+  const { data: poll } = await supabase.from("polls").select("*").eq("id", pollId).single();
+  if (!poll) return res.status(404).json({ error: "not found" });
+  if (poll.locked) return res.status(403).json({ error: "locked" });
+
+  // 先刪掉這人舊的，再插入新的（一次送出 = 最終選擇）
+  await supabase.from("votes").delete().eq("poll_id", pollId).eq("user_id", userId);
+  if (slotIds && slotIds.length) {
+    const rows = slotIds.map((sid) => ({ poll_id: pollId, user_id: userId, name, slot_id: sid }));
+    await supabase.from("votes").insert(rows);
+  }
+
+  // 推送最新統計到群組
+  const vbs = await getVotersBySlot(pollId);
+  const counts = await getCounts(pollId);
+  const summary = poll.slots.map((s) => s.label.split(" ")[0] + "→" + (counts[s.id] || 0)).join("｜");
+  pushTo(poll.group_id, [
+    txt("🏀 " + poll.title + "\n" + name + " 更新了投票\n目前：" + summary),
+    buildEntryFlex(poll, counts),
+  ]);
+  res.json({ ok: true, votersBySlot: vbs });
+});
+
+app.get("/healthz", (req, res) => res.send("ok"));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("HOOPS bot v2 listening on " + PORT));
+app.listen(PORT, () => console.log("HOOPS LIFF server listening on " + PORT));

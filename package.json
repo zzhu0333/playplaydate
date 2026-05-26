@@ -1,15 +1,12 @@
 {
-  "name": "line-hoops-bot",
+  "name": "hoops-liff",
   "version": "1.0.0",
-  "description": "LINE 籃球約團投票機器人",
+  "description": "LINE 籃球約團投票 LIFF 網頁版",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "express": "^4.22.2"
+    "express": "^4.19.2",
+    "@supabase/supabase-js": "^2.45.0"
   }
 }
