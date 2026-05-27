@@ -193,8 +193,8 @@ async function handleEvent(event) {
       return resolveName(source, (name) =>
         reply(event.replyToken, [txt(
           "✅ 發起人：" + name +
-          "\n\n請複製下方格式、填好後送出：\n\n" +
-          "（每行一個時段，格式為「日期 時間 地點」）\n" +
+          "\n\n請複製下方格式、填好後送出：\n" +
+          "（每行一個時段，格式為「日期 時間 地點」）\n\n" +
           "開團（輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n" 
           
         )])
