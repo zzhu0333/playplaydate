@@ -190,15 +190,17 @@ async function handleEvent(event) {
 
     // 只打「開團」兩字（沒帶名稱、沒帶時段）→ 只回引導，先不建團
     if (!title && slotLabels.length === 0) {
-      return resolveName(source, (name) =>
-        reply(event.replyToken, [txt(
-          "✅ 發起人：" + name +
-          "\n\n請複製下方格式、填好後送出：\n" +
-          "（每行一個時段，格式為「日期 時間 地點」）\n\n" +
-          "開團（輸入開團名稱）\n5/31 18:00-20:00 台北\n6/7 16:00-18:00 桃園\n\n" 
-          
-        )])
-      );
+          return resolveName(source, (name) =>
+            reply(event.replyToken, [txt(
+        `✅ 發起人：${name}
+        請複製下方格式、填好後送出：
+        每行一個時段，格式為「日期 時間 地點」）
+        
+        開團（輸入開團名稱）
+        5/31 18:00-20:00 台北
+        6/7 16:00-18:00 桃園`
+            )])
+        );
     }
 
     resolveName(source, async (name) => {
