@@ -210,7 +210,7 @@ function renderBySlot(){
 
 function renderLocked(){
   const sorted = POLL.slots.map(s=>({...s,voters:votersBySlot[s.id]||[]})).sort((a,b)=>b.voters.length-a.voters.length);
-  let h = `<div class="head"><div class="title">🏀 ${POLL.title}</div><div class="locked-badge">投票已結束</div></div>`;
+  let h = `<div class="head"><div class="title">${POLL.title}</div><div class="locked-badge">投票已結束</div></div>`;
   sorted.forEach((s,i)=>{
     const sp=splitLabel(s.label);
     h+=`<div class="slot" style="cursor:default">
