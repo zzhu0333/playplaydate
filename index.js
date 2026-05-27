@@ -126,7 +126,7 @@ function buildResultText(poll, votersBySlot, finalize) {
   });
   if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n\n";
   if (finalize && sorted[0] && sorted[0].voters.length > 0)
-    t += "👑 最多人：" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
+    t += "👑最多人：\n" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
   return t.trim();
 }
 
