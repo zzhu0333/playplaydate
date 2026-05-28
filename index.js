@@ -110,37 +110,44 @@ function buildEntryFlex(poll, counts) {
   };
 }
 
-// 對齊好讀的結果文字（編號條列、時間對齊，👑 最多人放最後）
+// 對齊好讀的結果文字（總人頭、每人括號標數量，👑 最多人放最後）
 function buildResultText(poll, votersBySlot, finalize) {
-  const slots = poll.slots.map((s) => ({ ...s, voters: votersBySlot[s.id] || [] }));
-  const sorted = slots.slice().sort((a, b) => b.voters.length - a.voters.length);
+  const slots = poll.slots.map((s) => {
+    const vs = votersBySlot[s.id] || [];
+    const total = vs.reduce((sum, v) => sum + (v.count || 1), 0);
+    return { ...s, voters: vs, total };
+  });
+  const sorted = slots.slice().sort((a, b) => b.total - a.total);
 
   let t = (finalize ? "📢 投票結束！\n" : "") + poll.title + "\n";
   t += "━━━━━━━━━━\n";
   sorted.forEach((s) => {
-    t += "▸ " + s.label + "　" + s.voters.length + " 人\n";
+    t += "▸ " + s.label + "　" + s.total + " 人\n";
     if (s.voters.length) {
-      s.voters.forEach((name, idx) => { t += "　" + (idx + 1) + ". " + name + "\n"; });
+      s.voters.forEach((v, idx) => {
+        const extra = v.count > 1 ? "（" + v.count + "）" : "";
+        t += "　" + (idx + 1) + ". " + v.name + extra + "\n";
+      });
     }
     t += "\n";
   });
-  if (sorted.every((s) => s.voters.length === 0)) t += "（還沒有人投票）\n\n";
-  if (finalize && sorted[0] && sorted[0].voters.length > 0)
-    t += "👑最多人：\n" + sorted[0].label + "（" + sorted[0].voters.length + " 人）";
+  if (sorted.every((s) => s.total === 0)) t += "（還沒有人投票）\n\n";
+  if (finalize && sorted[0] && sorted[0].total > 0)
+    t += "👑最多人：\n" + sorted[0].label + "（" + sorted[0].total + " 人）";
   return t.trim();
 }
 
-// 取得某 poll 的票數統計
+// 取得某 poll 的票數統計（加總人頭）
 async function getCounts(pollId) {
-  const { data } = await supabase.from("votes").select("slot_id").eq("poll_id", pollId);
+  const { data } = await supabase.from("votes").select("slot_id, count").eq("poll_id", pollId);
   const counts = {};
-  (data || []).forEach((v) => { counts[v.slot_id] = (counts[v.slot_id] || 0) + 1; });
+  (data || []).forEach((v) => { counts[v.slot_id] = (counts[v.slot_id] || 0) + (v.count || 1); });
   return counts;
 }
 async function getVotersBySlot(pollId) {
-  const { data } = await supabase.from("votes").select("slot_id, name").eq("poll_id", pollId);
+  const { data } = await supabase.from("votes").select("slot_id, name, count").eq("poll_id", pollId);
   const m = {};
-  (data || []).forEach((v) => { (m[v.slot_id] = m[v.slot_id] || []).push(v.name); });
+  (data || []).forEach((v) => { (m[v.slot_id] = m[v.slot_id] || []).push({ name: v.name, count: v.count || 1 }); });
   return m;
 }
 
@@ -281,29 +288,33 @@ app.get("/api/poll/:id", async (req, res) => {
   res.json({ poll, votersBySlot: vbs });
 });
 
-// 取得「某使用者目前投了哪些」
+// 取得「某使用者目前投了哪些、各帶幾人」
 app.get("/api/poll/:id/my", async (req, res) => {
   const userId = req.query.userId;
-  const { data } = await supabase.from("votes").select("slot_id").eq("poll_id", req.params.id).eq("user_id", userId);
-  res.json({ slotIds: (data || []).map((v) => v.slot_id) });
+  const { data } = await supabase.from("votes").select("slot_id, count").eq("poll_id", req.params.id).eq("user_id", userId);
+  res.json({ selections: (data || []).map((v) => ({ slotId: v.slot_id, count: v.count || 1 })) });
 });
 
 // 送出投票（覆蓋該使用者在此 poll 的所有選擇）
 app.post("/api/poll/:id/vote", async (req, res) => {
   const pollId = req.params.id;
-  const { userId, name, slotIds } = req.body;
+  const { userId, name, selections } = req.body;
+  // selections 格式：[{ slotId, count }]
   const { data: poll } = await supabase.from("polls").select("*").eq("id", pollId).single();
   if (!poll) return res.status(404).json({ error: "not found" });
   if (poll.locked) return res.status(403).json({ error: "locked" });
 
   // 先刪掉這人舊的，再插入新的（一次送出 = 最終選擇）
   await supabase.from("votes").delete().eq("poll_id", pollId).eq("user_id", userId);
-  if (slotIds && slotIds.length) {
-    const rows = slotIds.map((sid) => ({ poll_id: pollId, user_id: userId, name, slot_id: sid }));
+  if (selections && selections.length) {
+    const rows = selections.map((s) => ({
+      poll_id: pollId, user_id: userId, name,
+      slot_id: s.slotId, count: Math.max(1, parseInt(s.count) || 1),
+    }));
     await supabase.from("votes").insert(rows);
   }
 
-  // 推送最新統計到群組
+  // 推送最新統計到群組（總人頭）
   const vbs = await getVotersBySlot(pollId);
   const counts = await getCounts(pollId);
   let summary = poll.title + "\n" + name + " 更新了投票\n━━━━━━━━━━\n";
