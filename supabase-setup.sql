@@ -31,3 +31,7 @@ alter table polls enable row level security;
 alter table votes enable row level security;
 create policy "allow all polls" on polls for all using (true) with check (true);
 create policy "allow all votes" on votes for all using (true) with check (true);
+
+alter table votes add column if not exists count integer not null default 1;
+
+
